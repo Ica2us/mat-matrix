@@ -341,7 +341,7 @@ class TestAnomalyExplainer:
 
         assert len(explanation) > 0, "应有异常样本被解释"
         for idx, info in explanation.items():
-            assert "mahalanobis" in info
+            assert "squared_mahalanobis" in info
             assert info["is_anomaly"] is True
             assert "contributions" in info
             assert "top_features" in info

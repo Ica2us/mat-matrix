@@ -8,7 +8,7 @@ Outlier detection (robust_anomaly_detection)
   - Converts compositional (simplex) columns to ilr space via SBP matrix.
   - Merges with numeric columns → high-dimensional real space.
   - Uses scikit-learn's MinCovDet (FAST-MCD) for robust location / scatter.
-  - Flags samples whose robust Mahalanobis distance > χ²_{dof, 0.99}.
+  - Flags samples whose robust squared Mahalanobis distance > χ²_{dof, 0.99}.
 
 Distribution drift (calculate_distribution_drift)
   - Rigorous guard: both groups must have ≥ 30 rows.
@@ -152,7 +152,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
           - comp_cols → 零值替代 → ilr 变换 → (n, d_comp-1)
           - numeric_cols → z-score 标准化 → (n, d_num)
           - 拼接 → (n, p)
-          - FAST-MCD → 稳健马氏距离
+          - FAST-MCD → 稳健（平方）马氏距离
           - χ²(p, 1-α) 阈值判定异常
 
         Args:
@@ -161,9 +161,9 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
             numeric_cols: 数值指标列名列表
 
         Returns:
-            (anomaly_mask, mahalanobis_distances)
-              anomaly_mask:         shape (n,), True 表示异常
-              mahalanobis_distances: shape (n,), 稳健马氏距离
+            (anomaly_mask, squared_mahalanobis)
+              anomaly_mask:       shape (n,), True 表示异常
+              squared_mahalanobis: shape (n,), 稳健平方马氏距离 (MD²)
         """
         n = len(df)
         if n == 0:
@@ -202,14 +202,14 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         mcd = MinCovDet(random_state=self.random_state)
         mcd.fit(X)
 
-        # --- 5. 稳健马氏距离 ---
-        mahal = mcd.mahalanobis(X)  # shape (n,)
+        # --- 5. 稳健平方马氏距离 (MinCovDet.mahalanobis 返回 MD²) ---
+        mahal_sq = mcd.mahalanobis(X)  # shape (n,)
 
-        # --- 6. χ² 阈值判定 ---
+        # --- 6. χ² 阈值判定（χ² 分布的正是平方距离）---
         threshold = chi2.ppf(1.0 - self.anomaly_alpha, df=p)
-        anomaly_mask = mahal > threshold
+        anomaly_mask = mahal_sq > threshold
 
-        return anomaly_mask, mahal
+        return anomaly_mask, mahal_sq
 
     # -----------------------------------------------------------------
     # calculate_distribution_drift
@@ -317,7 +317,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         Returns:
             {
               <row_index>: {
-                "mahalanobis": float,               # 该样本的马氏距离
+                "squared_mahalanobis": float,               # 该样本的平方马氏距离 (MD²)
                 "is_anomaly":   bool,               # 是否异常
                 "contributions": {
                   <feature_name>: float,             # 归一化贡献度百分比 (0-100)
@@ -358,22 +358,16 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         mcd = MinCovDet(random_state=self.random_state)
         mcd.fit(X)
 
-        mahal = mcd.mahalanobis(X)
+        mahal_sq = mcd.mahalanobis(X)
         threshold = chi2.ppf(1.0 - self.anomaly_alpha, df=p)
-        anomaly_mask = mahal > threshold
+        anomaly_mask = mahal_sq > threshold
 
-        # --- 2. 构建原始特征名列表（ilr 维度压缩 → 每个成分列仍是独立原始特征） ---
-        # 对 comp_cols：成分列直接使用原名，因为每个成分是一个独立物理变量
-        # 对 numeric_cols：直接使用原名
-        orig_feature_names: List[str] = []
-        # 标记每个原始特征在 (comp_cols + numeric_cols) 中的起点块大小
-        orig_n_features = len(comp_cols) + len(numeric_cols)
-        if orig_n_features == 0:
-            raise ValueError("至少需要一种特征列")
+        result: Dict[int, Dict[str, Any]] = {}
+        anomalous_indices = np.where(anomaly_mask)[0]
+        if len(anomalous_indices) == 0:
+            return result
 
-        orig_feature_names = list(comp_cols) + list(numeric_cols)
-
-        # --- 3. 对每个异常样本计算特征贡献 ---
+        # --- 2. 提取 MCD 参数用于逐样本消融 ---
         center = mcd.location_  # shape (p,)
         cov_inv = np.linalg.inv(mcd.covariance_)  # shape (p, p)
 
@@ -447,7 +441,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
                 sorted_features = sorted_features[:top_k]
 
             result[int(idx)] = {
-                "mahalanobis": float(mahal[idx]),
+                "squared_mahalanobis": float(mahal_sq[idx]),  # MD²
                 "is_anomaly": True,
                 "contributions": contributions,
                 "top_features": sorted_features,
