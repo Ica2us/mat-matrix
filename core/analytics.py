@@ -273,12 +273,14 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
                 }
                 continue
 
-            stat, pv = ks_2samp(series_a, series_b)
+            stat, pv = ks_2samp(series_a.tolist(), series_b.tolist())
+            stat_f = float(stat)  # type: ignore[arg-type]
+            pv_f = float(pv)  # type: ignore[arg-type]
             result[col] = {
-                "ks_statistic": float(stat),
-                "p_value": float(pv),
+                "ks_statistic": stat_f,
+                "p_value": pv_f,
                 "bonferroni_alpha": bonf_alpha,
-                "is_drifted": bool(pv < bonf_alpha),
+                "is_drifted": bool(pv_f < bonf_alpha),
             }
 
         return result
@@ -379,14 +381,9 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
             psi = _build_sbp_matrix(d)
             norms = np.sqrt(np.sum(psi ** 2, axis=0))
             psi_normed = psi / norms[np.newaxis, :]  # (d, d-1)
-            # 权重矩阵 W: (d, d-1)，W[i,j] = psi_normed[i,j]
-            # 成分 i 的扰动会传播到所有 ilr_j，幅度为 W[i,j]
-            ilr_weight = psi_normed  # 暂存用于贡献度分解
+            ilr_weight: Optional[np.ndarray] = psi_normed
         else:
             ilr_weight = None
-
-        result: Dict[int, Dict[str, Any]] = {}
-        anomalous_indices = np.where(anomaly_mask)[0]
 
         for idx in anomalous_indices:
             x = X[idx]  # shape (p,)
