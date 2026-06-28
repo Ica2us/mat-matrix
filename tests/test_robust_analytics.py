@@ -317,5 +317,122 @@ class TestBatchDriftIntegration:
             )
 
 
+# =====================================================================
+# 4. 异常解释器测试
+# =====================================================================
+
+class TestAnomalyExplainer:
+    """验证 anomaly_explain 的特征贡献度分解"""
+
+    def test_explain_anomalous_samples(self, engine: RobustAnalyticsEngine) -> None:
+        """含离群点的数据，异常样本应返回正确结构"""
+        import pandas as pd
+        np.random.seed(42)
+        comp = np.random.dirichlet([10, 10, 10, 10], size=80)
+        num = np.random.randn(80, 2)
+        # 后 4 条拉成极端值
+        comp[-4:] = [0.98, 0.01, 0.005, 0.005]
+        num[-4:, :] = 9.0
+        df = pd.DataFrame(
+            np.column_stack([comp, num]),
+            columns=["c1", "c2", "c3", "c4", "n1", "n2"],
+        )
+        explanation = engine.anomaly_explain(df, ["c1", "c2", "c3", "c4"], ["n1", "n2"], top_k=3)
+
+        assert len(explanation) > 0, "应有异常样本被解释"
+        for idx, info in explanation.items():
+            assert "mahalanobis" in info
+            assert info["is_anomaly"] is True
+            assert "contributions" in info
+            assert "top_features" in info
+            assert len(info["top_features"]) <= 3
+            # 验证贡献度之和约等于 100%
+            total = sum(info["contributions"].values())
+            assert abs(total - 100.0) < 1.0, f"贡献度之和应≈100%，实际 {total:.2f}"
+
+    def test_explain_no_anomalies_returns_empty(self, engine: RobustAnalyticsEngine) -> None:
+        """tightly clustered 数据，无异常时返回空字典"""
+        import pandas as pd
+        np.random.seed(7)
+        comp = np.random.dirichlet([10, 10, 10, 10], size=60)
+        num = np.random.randn(60, 2) * 0.3
+        df = pd.DataFrame(
+            np.column_stack([comp, num]),
+            columns=["c1", "c2", "c3", "c4", "n1", "n2"],
+        )
+        # 先确认没有异常再调用 explain
+        mask, _ = engine.robust_anomaly_detection(df, ["c1", "c2", "c3", "c4"], ["n1", "n2"])
+        explanation = engine.anomaly_explain(df, ["c1", "c2", "c3", "c4"], ["n1", "n2"])
+        assert len(explanation) == mask.sum(), (
+            f"explain 应仅返回 anomaly_mask 为 True 的行，"
+            f"mask={mask.sum()} vs explain={len(explanation)}"
+        )
+
+    def test_explain_numeric_only(self, engine: RobustAnalyticsEngine) -> None:
+        """仅数值列的解释正常工作"""
+        import pandas as pd
+        np.random.seed(42)
+        num = np.random.randn(80, 2)
+        num[-4:, :] = [10.0, -8.0]
+        df = pd.DataFrame(num, columns=["m1", "m2"])
+        explanation = engine.anomaly_explain(df, [], ["m1", "m2"], top_k=2)
+
+        assert len(explanation) > 0
+        for info in explanation.values():
+            assert set(info["contributions"].keys()) == {"m1", "m2"}
+            assert sum(info["contributions"].values()) == pytest.approx(100.0, abs=1.0)
+
+    def test_explain_contribution_rank_plausible(self, engine: RobustAnalyticsEngine) -> None:
+        """已知某列发生异常偏移时，该列应出现在 top_features 首位"""
+        import pandas as pd
+        np.random.seed(42)
+        n = 100
+        comp = np.random.dirichlet([10, 10, 10, 10], size=n)
+        num = np.random.randn(n, 2)
+        # 仅在 n1 上制造大偏移
+        num[-1, 0] = 25.0
+        df = pd.DataFrame(
+            np.column_stack([comp, num]),
+            columns=["c1", "c2", "c3", "c4", "n1", "n2"],
+        )
+        explanation = engine.anomaly_explain(df, ["c1", "c2", "c3", "c4"], ["n1", "n2"], top_k=5)
+        # 最后一个样本应被标记且 n1 贡献度高
+        if len(explanation) > 0:
+            last_idx = max(explanation.keys())
+            info = explanation[last_idx]
+            assert info["top_features"][0] == "n1", (
+                f"n1 应为最高贡献特征，实际 top_features={info['top_features']}"
+            )
+
+    def test_explain_top_k_filter(self, engine: RobustAnalyticsEngine, contaminated_df: "pd.DataFrame") -> None:
+        """top_k=1 时仅返回贡献度最高的一个特征"""
+        explanation = engine.anomaly_explain(
+            contaminated_df, ["c1", "c2", "c3"], ["n1", "n2"], top_k=1,
+        )
+        if len(explanation) > 0:
+            for info in explanation.values():
+                assert len(info["top_features"]) == 1
+                # contributions 全量应为 5（3 comp + 2 numeric）
+                assert len(info["contributions"]) == 5
+
+    def test_explain_no_top_k_returns_all(self, engine: RobustAnalyticsEngine, contaminated_df: "pd.DataFrame") -> None:
+        """top_k=None 时返回全部特征"""
+        explanation = engine.anomaly_explain(
+            contaminated_df, ["c1", "c2", "c3"], ["n1", "n2"], top_k=None,
+        )
+        if len(explanation) > 0:
+            for info in explanation.values():
+                assert len(info["top_features"]) == len(info["contributions"])
+                assert set(info["top_features"]) == set(info["contributions"].keys())
+
+    def test_explain_empty_dataframe_raises(self, engine: RobustAnalyticsEngine) -> None:
+        """空 DataFrame 应抛出 ValueError"""
+        import pandas as pd
+        with pytest.raises(ValueError, match="空"):
+            engine.anomaly_explain(
+                pd.DataFrame(), comp_cols=["a"], numeric_cols=["b"],
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
