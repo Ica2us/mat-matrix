@@ -16,12 +16,6 @@ import pandas as pd
 from contracts import GLOBAL_RANDOM_STATE, BayesianOptimizationProtocol
 
 
-# ---------------------------------------------------------------------------
-# Deterministic RNG — single source of truth for this module
-# ---------------------------------------------------------------------------
-_RNG: np.random.Generator = np.random.default_rng(GLOBAL_RANDOM_STATE)
-
-
 class MaterialBayesianOptimizer(BayesianOptimizationProtocol):
     """
     Multi-objective Bayesian optimisation engine for material formulation

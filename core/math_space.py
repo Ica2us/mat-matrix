@@ -15,12 +15,6 @@ import numpy as np
 from contracts import GLOBAL_RANDOM_STATE, CompositionalMathProtocol
 
 
-# ---------------------------------------------------------------------------
-# Deterministic RNG — single source of truth for this module
-# ---------------------------------------------------------------------------
-_RNG: np.random.Generator = np.random.default_rng(GLOBAL_RANDOM_STATE)
-
-
 def _helmert_contrast_matrix(d: int) -> np.ndarray:
     """
     Build the **standard (orthonormal) Helmert contrast matrix** of size ``d x d``.
@@ -105,6 +99,16 @@ class CompositionalMathTransformer(CompositionalMathProtocol):
         X = np.asarray(X, dtype=np.float64)
         n_rows, n_cols = X.shape
 
+        # Guard: if eps is so large that even a single zero-replacement
+        # could push the scaling factor negative (worst case = all columns
+        # are zero), abort early with a clear message.
+        if n_cols * eps >= 1.0:
+            raise ValueError(
+                f"eps ({eps}) is too large for {n_cols} components: "
+                f"n_cols * eps = {n_cols * eps} >= 1.0. "
+                "Choose a smaller eps such that n_cols * eps < 1.0."
+            )
+
         # Detect zeros per row
         zero_mask = X <= 0
         n_zeros = np.sum(zero_mask, axis=1)  # shape (n,)
@@ -153,11 +157,16 @@ class CompositionalMathTransformer(CompositionalMathProtocol):
             if np.any(mixed):
                 orig_nonzero = mixed[:, np.newaxis] & (~zero_mask)
                 orig_nonzero_sum = np.sum(X * orig_nonzero, axis=1)
-                scale = np.where(
-                    orig_nonzero_sum > 0,
-                    cap / orig_nonzero_sum,
-                    0.0,
-                )
+                # Safety: orig_nonzero_sum is guaranteed > 0 for surviving
+                # mixed rows (otherwise the row would be all-zero and already
+                # handled).  The guard exists only to silence numpy's
+                # divide-by-zero warning on rows not in `mixed`.
+                with np.errstate(divide="ignore"):
+                    scale = np.where(
+                        orig_nonzero_sum > 0,
+                        cap / orig_nonzero_sum,
+                        0.0,
+                    )
                 result[orig_nonzero] *= np.broadcast_to(
                     scale[:, np.newaxis], result.shape
                 )[orig_nonzero]
