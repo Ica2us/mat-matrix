@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, cast
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from scipy.stats import chi2, kstest
+from scipy.stats import chi2, kstest,ks_2samp
 from sklearn.covariance import MinCovDet  # type: ignore[import-untyped]
 
 from contracts import GLOBAL_RANDOM_STATE, AdvancedAnalyticsProtocol
@@ -130,8 +130,9 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
                 nz = zero_mask.sum()
                 # 替换零为 eps
                 row[zero_mask] = eps
-                # 等比缩减非零元素
-                row[~zero_mask] *= (1.0 - nz * eps) / row[~zero_mask].sum()
+                nonzero_sum = row[~zero_mask].sum()
+                if nonzero_sum > 0:
+                    row[~zero_mask] *= (1.0 - nz * eps) / nonzero_sum
             Xr[i] = row
         return Xr
 
@@ -272,7 +273,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
                 }
                 continue
 
-            stat, pv = kstest(series_a.tolist(), series_b.tolist())
+            stat, pv = ks_2samp(series_a, series_b)
             result[col] = {
                 "ks_statistic": float(stat),
                 "p_value": float(pv),
@@ -554,8 +555,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
             if return_details:
                 summary["details"] = drift_result
 
-            if drift_axis == 1:
-                results_axis1.append(summary)
+            results_axis1.append(summary)
 
         if drift_axis == 0:
             return {
