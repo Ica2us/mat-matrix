@@ -13,21 +13,22 @@ from __future__ import annotations
 
 import re
 from html import escape as _escape
+from typing import Match
 
 
-def _repl_bold(m: re.Match) -> str:
+def _repl_bold(m: Match[str]) -> str:
     return f"<strong>{m.group(1)}</strong>"
 
-def _repl_italic(m: re.Match) -> str:
+def _repl_italic(m: Match[str]) -> str:
     return f"<em>{m.group(1)}</em>"
 
-def _repl_code(m: re.Match) -> str:
+def _repl_code(m: Match[str]) -> str:
     return f"<code>{m.group(1)}</code>"
 
-def _repl_link(m: re.Match) -> str:
+def _repl_link(m: Match[str]) -> str:
     return f'<a href="{_escape(m.group(2), quote=True)}">{_escape(m.group(1))}</a>'
 
-def _repl_image(m: re.Match) -> str:
+def _repl_image(m: Match[str]) -> str:
     return f'<img src="{_escape(m.group(2), quote=True)}" alt="{_escape(m.group(1))}" style="max-width:100%">'
 
 
