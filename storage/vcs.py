@@ -29,8 +29,11 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
         self._manifest_dir.mkdir(parents=True, exist_ok=True)
 
         self._db_path = self._index_dir / "vcs_index.sqlite"
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(self._db_path), timeout=30.0, check_same_thread=False
+        )
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA busy_timeout=30000;")
         self._init_schema()
 
     # -----------------------------------------------------------------
