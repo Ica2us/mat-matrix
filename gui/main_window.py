@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 os.environ["QT_API"] = "pyside6"
@@ -28,10 +27,10 @@ plt.rcParams["axes.unicode_minus"] = False
 
 import numpy as np
 import pandas as pd
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT  # type: ignore[attr-defined]  # type: ignore[attr-defined]
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT  # type: ignore[attr-defined]
 from matplotlib.figure import Figure
 from PySide6.QtCore import QThreadPool, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -52,7 +51,6 @@ from PySide6.QtWidgets import (
 
 from core.analytics import RobustAnalyticsEngine
 from engine.bo import MaterialBayesianOptimizer
-from engine.pareto_fast import fast_non_dominated_sort
 from storage.db_engine import DuckDBStorageEngine
 from storage.vcs import MerkleDAGVersionControl
 from gui.markdown_render import md_to_html
@@ -61,6 +59,88 @@ from gui.table_view import ConditionFormatTable
 from gui.scatter_canvas import HoverScatterCanvas
 from gui.pareto_canvas import ParetoCanvas
 from gui.staging_panel import StagingPanel
+
+from gui.in_situ_widget import InSituVideoCharacterizationWidget
+
+
+# =====================================================================
+# 核心融入：基于 Pandas + 启发式规则的智能列类型推理与数据治理引擎
+# =====================================================================
+class ImportTypeInferenceEngine:
+    """
+    工业级物料数据特征空间多维启发式推理引擎。
+    不看表头，依据数值区间自动推断成分占比与工艺/响应参数，并执行守恒约束校验。
+    """
+    @staticmethod
+    def infer_and_validate(df: pd.DataFrame) -> Dict[str, Any]:
+        # 仅提取数值型列进行统计解构
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        skip = {"exp_id", "expid", "id", "sample", "batch", "pareto_front"}
+        numeric_cols = [c for c in numeric_cols if c.lower().strip() not in skip and "id" not in c.lower()]
+
+        inferred_comps = []
+        inferred_others = []
+
+        # ---- 阶段 1: 扫描数值特征矩与有界空间边界 ----
+        for col in numeric_cols:
+            series = df[col].dropna()
+            if series.empty:
+                continue
+            
+            c_min, c_max = series.min(), series.max()
+            col_lower = col.lower()
+
+            # 强暗示判定：若列名强暗示为温度/时间/压力等物理工艺量，优先划入非成分类
+            if any(k in col_lower for k in ["temp", "time", "press", "load", "curing", "param"]):
+                inferred_others.append(col)
+                continue
+
+            # 规则 A: 小数制成分判定 —— 数值严格落在 [0.0, 1.005] 内，且具备连续分布特征
+            if 0.0 <= c_min and c_max <= 1.005:
+                if series.nunique() > 2 or (c_min != c_max):  # 排除全 0/1 的常数或布尔控制列
+                    inferred_comps.append(col)
+                else:
+                    inferred_others.append(col)
+            
+            # 规则 B: 百分制成分判定 —— 数值落在 [0.0, 100.005] 内
+            elif 0.0 <= c_min and c_max <= 100.005:
+                # 排除可能在该区间波动的高危工艺/物理响应参数（如强度、成本等）
+                if any(k in col_lower for k in ["target", "strength", "elong", "yield", "强度", "成本", "cost", "tensile"]):
+                    inferred_others.append(col)
+                else:
+                    inferred_comps.append(col)
+            else:
+                inferred_others.append(col)
+
+        # ---- 阶段 2: 验证单纯形守恒空间（Simplex Closure Check） ----
+        is_percentage = False
+        needs_normalization = False
+        scale_factor = 1.0
+
+        if inferred_comps:
+            row_sums = df[inferred_comps].sum(axis=1)
+            mean_sum = row_sums.mean()
+            
+            # 动态判别当前体系是标准小数制(和为1)还是工业百分制(和为100%)
+            if 80.0 <= mean_sum <= 120.0:
+                is_percentage = True
+                scale_factor = 100.0
+            else:
+                is_percentage = False
+                scale_factor = 1.0
+
+            # 计算各样本行偏离物理守恒界线的绝对误差，若任一行偏离绝对值 > 1e-3 则判定需要归一化
+            deviations = np.abs(row_sums - scale_factor)
+            if (deviations > 1e-3).any():
+                needs_normalization = True
+
+        return {
+            "comps": inferred_comps,
+            "others": inferred_others,
+            "is_percentage": is_percentage,
+            "needs_normalization": needs_normalization,
+            "scale_factor": scale_factor
+        }
 
 
 # =====================================================================
@@ -82,7 +162,7 @@ class ExperimentData:
         return self.comp_cols + self.param_cols
 
     def guess_column_roles(self) -> None:
-        """启发式猜测列角色（基于列名和数据类型）。"""
+        """基础保底猜测逻辑（高级智能识别已由导入区引擎接管）。"""
         cols = list(self.df.columns)
         skip = {"exp_id", "expid", "id", "sample", "batch", "date", "备注", "note"}
         comp, param, target = [], [], []
@@ -157,8 +237,6 @@ class RightDetailPanel(QWidget):
         self.setFixedWidth(300)
         self._build_ui()
 
-    # ── UI 构建 ──
-
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -227,75 +305,13 @@ class RightDetailPanel(QWidget):
 
         layout.addWidget(note_group, 1)
 
-    # ── 元数据更新 ──
-
-    def update_metadata(
-        self,
-        commit_id: str,
-        parent_ids: Optional[List[str]] = None,
-        data: Optional[Dict[str, str]] = None,
-    ) -> None:
-        """更新元数据标签。"""
-        self._current_commit_id = commit_id
-        self._current_parent_ids = parent_ids or []
-
-        commit_short = commit_id[:8] if commit_id else "—"
-        parent_short = self._current_parent_ids[0][:8] if self._current_parent_ids else "(root)"
-
-        self._meta_labels["Commit"].setText(f"<b>Commit:</b> {commit_short}")
-        self._meta_labels["父版本"].setText(f"<b>父版本:</b> {parent_short}")
-
-        if data:
-            for key, val in data.items():
-                if key in self._meta_labels:
-                    self._meta_labels[key].setText(f"<b>{key}:</b> {val}")
-
-    # ── 异常诊断更新 ──
-
-    def update_anomaly(self, df: pd.DataFrame, numeric_cols: List[str]) -> None:
-        """计算异常检测并更新诊断区。"""
-        if df.empty or not numeric_cols:
-            self._diag_status.setText("MCD 距离: — (无数据)")
-            self._anomaly_chart.setVisible(False)
-            return
-
-        analytics = RobustAnalyticsEngine()
-        mask, distances = analytics.robust_anomaly_detection(df, [], numeric_cols)
-        has_anomaly = bool(mask.any())
-
-        if has_anomaly:
-            max_dist = float(distances.max())
-            self._diag_status.setText(
-                f'<span style="color:red">MCD 距离: {max_dist:.2f} (离群)</span>'
-            )
-
-            # 计算各维度贡献度（Z-score 均值）
-            numeric_data = df[numeric_cols].values
-            means = np.nanmean(numeric_data, axis=0)
-            stds = np.nanstd(numeric_data, axis=0)
-            stds = np.where(stds == 0, 1e-12, stds)
-            z_scores = np.abs((numeric_data - means) / stds)
-            avg_z = z_scores.mean(axis=0)
-            scores: Dict[str, float] = {col: float(z) for col, z in zip(numeric_cols, avg_z)}
-
-            self._anomaly_chart.plot_contributions(scores)
-            self._anomaly_chart.setVisible(True)
-        else:
-            avg_dist = float(distances.mean())
-            self._diag_status.setText(f"MCD 距离: {avg_dist:.2f} (正常)")
-            self._anomaly_chart.setVisible(False)
-
-    # ── 注释功能 ──
-
     def _on_tab_changed(self, index: int) -> None:
-        """切换编辑/预览标签时更新预览内容。"""
         if index == 1:
             self._note_text = self._note_edit.toPlainText()
             html = md_to_html(self._note_text)
             self._note_preview.setHtml(html)
 
     def _on_save_note(self) -> None:
-        """保存注释（直接更新，简化版本）。"""
         self._note_text = self._note_edit.toPlainText()
         if not self._note_text.strip():
             return
@@ -304,9 +320,47 @@ class RightDetailPanel(QWidget):
         self._btn_save_note.setEnabled(True)
 
     def load_note(self, note_text: str) -> None:
-        """加载历史注释。"""
         self._note_text = note_text
         self._note_edit.setPlainText(note_text)
+
+    def update_metadata(self, commit_id: str, data: Dict[str, str]) -> None:
+        """更新元数据区域显示内容。"""
+        if "实验 ID" in data:
+            self._meta_labels["实验 ID"].setText(f"<b>实验 ID:</b> {data['实验 ID']}")
+        if "操作人" in data:
+            self._meta_labels["操作人"].setText(f"<b>操作人:</b> {data['操作人']}")
+        if commit_id:
+            self._meta_labels["Commit"].setText(
+                f"<b>Commit:</b> <code>{commit_id[:16]}...</code>"
+            )
+
+    def update_anomaly(
+        self, df: pd.DataFrame, target_cols: List[str]
+    ) -> None:
+        """运行异常检测并更新诊断区域显示。"""
+        try:
+            numeric_cols = [c for c in target_cols if c in df.columns]
+            if not numeric_cols:
+                return
+            _, mahal_sq = self._analytics.robust_anomaly_detection(
+                df, comp_cols=[], numeric_cols=numeric_cols,
+            )
+            mean_md = float(np.mean(mahal_sq))
+            max_md = float(np.max(mahal_sq))
+            md95 = float(np.percentile(mahal_sq, 95))
+            self._diag_status.setText(
+                f"MCD 距离: 均值={mean_md:.2f}, "
+                f"P95={md95:.2f}, "
+                f"最大={max_md:.2f} "
+                f"{'(⚠ 含异常)' if max_md > 10 else '(正常)'}"
+            )
+        except Exception:
+            self._diag_status.setText("MCD 距离: — (计算失败)")
+
+
+# =====================================================================
+# 主窗口大闸调度器
+# =====================================================================
 
 class MainWindow(QMainWindow):
     """实验员决策仪表盘主窗口。"""
@@ -324,13 +378,13 @@ class MainWindow(QMainWindow):
         self._optimizer: Optional[MaterialBayesianOptimizer] = None
         self._storage: Optional[DuckDBStorageEngine] = None
         self._vcs: Optional[MerkleDAGVersionControl] = None
+        self._insitu_widget: Optional[InSituVideoCharacterizationWidget] = None
+
+        # ── 菜单 ──
+        self._setup_menu()
 
         # ── UI ──
         self._build_ui()
-
-    # -----------------------------------------------------------------
-    # 引擎惰性初始化
-    # -----------------------------------------------------------------
 
     def _get_analytics(self) -> RobustAnalyticsEngine:
         if self._analytics is None:
@@ -352,9 +406,33 @@ class MainWindow(QMainWindow):
             self._vcs = MerkleDAGVersionControl(index_dir="v")
         return self._vcs
 
-    # -----------------------------------------------------------------
-    # UI 构建
-    # -----------------------------------------------------------------
+    def _setup_menu(self) -> None:
+        mb = self.menuBar()
+
+        # 📁 数据
+        data_menu = mb.addMenu("📁 数据")
+        commit_action = QAction("🚀 提交暂存区 (Commit)", self)
+        commit_action.setShortcut(QKeySequence("Ctrl+Return"))
+        commit_action.triggered.connect(self._on_menu_commit)
+        data_menu.addAction(commit_action)
+
+        calibrate_action = QAction("📊 批次偏移校准", self)
+        calibrate_action.triggered.connect(self._on_menu_calibrate)
+        data_menu.addAction(calibrate_action)
+
+        # 👁 视图
+        view_menu = mb.addMenu("👁 视图")
+        view_menu.addAction("表格视图 (聚焦左侧)")
+        view_menu.addAction("重置布局")
+
+    def _on_menu_commit(self) -> None:
+        self.staging_panel._on_commit()
+
+    def _on_menu_calibrate(self) -> None:
+        QMessageBox.information(
+            self, "批次偏移校准",
+            "校准功能正在开发中",
+        )
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -363,7 +441,7 @@ class MainWindow(QMainWindow):
 
         # ── 工具栏 ──
         toolbar = QHBoxLayout()
-        self.btn_import = QPushButton("📁 导入 CSV")
+        self.btn_import = QPushButton("📁 导入并推理 CSV")
         self.btn_import.setMinimumHeight(36)
         self.btn_import.clicked.connect(self._on_import)
         toolbar.addWidget(self.btn_import)
@@ -425,6 +503,13 @@ class MainWindow(QMainWindow):
         self._build_recommend_tab()
         self.tabs.addTab(self.recommend_tab, "🧠 下一步推荐")
 
+        # Tab 5: 原位表征视频
+        self._insitu_widget = InSituVideoCharacterizationWidget(
+            table_view_reference=self.data_table.table_view,
+            main_dataframe=pd.DataFrame(),
+        )
+        self.tabs.addTab(self._insitu_widget, "📹 原位表征视频")
+
         h_split.addWidget(center_widget)
 
         # 右侧: 智能详情面板
@@ -450,8 +535,6 @@ class MainWindow(QMainWindow):
 
         self._update_status("请导入 CSV 数据文件")
 
-    # ---------------------------------------------------------
-    # 右侧详情面板（移除旧的简单实现）
     # ---------------------------------------------------------
     # Tab 1: 散点图
     # ---------------------------------------------------------
@@ -479,11 +562,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(nav)
         layout.addWidget(self.scatter_canvas, 1)
 
-        # 框选联动 → 表格高亮
         self.scatter_canvas.selectionChanged.connect(self._on_scatter_selection)
 
     def _on_scatter_selection(self, indices: List[int]) -> None:
-        """散点框选后，在右侧详情面板显示选中点信息。"""
         if self._data is None or not indices:
             self.right_panel.load_note("")
             return
@@ -543,7 +624,6 @@ class MainWindow(QMainWindow):
         self.pareto_canvas.point_clicked.connect(self._on_pareto_point_clicked)
 
     def _on_pareto_point_clicked(self, idx: int) -> None:
-        """点击 Pareto 点 → 右侧详情显示该实验数据。"""
         if self._data is None:
             return
         df = self._data.df
@@ -613,7 +693,6 @@ class MainWindow(QMainWindow):
             n = int(n_text)
             values = df[col].values[-n:]
 
-        # 用 matplotlib 直接画折线
         canvas = self.trend_canvas
         canvas.ax.clear()
         x_arr = np.arange(len(values))
@@ -808,7 +887,6 @@ class MainWindow(QMainWindow):
         else:
             self.anomaly_text.setPlainText("✅ 未发现异常样本")
 
-        # ── 右侧面板更新 ──
         if self._data is not None:
             self.right_panel.update_metadata(
                 commit_id=commit_id,
@@ -818,10 +896,8 @@ class MainWindow(QMainWindow):
                 self.right_panel.update_anomaly(self._data.df, target_cols)
 
         metrics = data["metrics"]
-        mask = data["pareto_mask"]
         labels = [str(i) for i in range(metrics.shape[0])]
         if target_cols:
-            # 只取前两个目标画 Pareto（ParetoCanvas 要求 2D）
             if metrics.shape[1] >= 2:
                 d1 = data.get("target_directions", ["maximize"] * 2)[0]
                 d2 = data.get("target_directions", ["maximize"] * 2)[1]
@@ -843,7 +919,7 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(True)
 
     # ---------------------------------------------------------
-    # 数据导入
+    # 核心深度融合修改点：智能化启发式导入与治理
     # ---------------------------------------------------------
 
     def _on_import(self) -> None:
@@ -861,8 +937,75 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导入失败", f"无法读取文件:\n{e}")
             return
 
+        # 🛠️ 唤醒核心启发式推理机
+        inference = ImportTypeInferenceEngine.infer_and_validate(df)
+        comps = inference["comps"]
+        others = inference["others"]
+        is_pct = inference["is_percentage"]
+        needs_norm = inference["needs_normalization"]
+        scale = inference["scale_factor"]
+
+        # ⚖️ 组分单纯形不守恒条件弹窗拦截
+        if comps and needs_norm:
+            unit_str = "100.0%" if is_pct else "1.0"
+            reply = QMessageBox.question(
+                self, 
+                "⚖️ 组分单纯形不封闭弹窗核验", 
+                f"检测到自动推理出的组分列 {comps} 在物理样本行中的均值加和不等于标准的物料守恒常数 ({unit_str})。\n\n"
+                f"是否启动系统内置的 [单纯形规整化投影算法] 自动进行全自动按行归一化对齐？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                row_sums = df[comps].sum(axis=1).replace(0, 1.0)
+                for col in comps:
+                    df[col] = (df[col] / row_sums) * scale
+
+        # 🔄 百分制自动优雅向下兼容降维转换（0~100% 映射至 0~1）
+        if comps and is_pct:
+            reply_conv = QMessageBox.question(
+                self,
+                "🔄 进制归一化自动转换",
+                "当前导入的成分列判定为百分制形式（0~100%）。为了完美兼容内核主动学习优化器，"
+                "是否自动将其平移规整为小数占比制（0~1）？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply_conv == QMessageBox.StandardButton.Yes:
+                for col in comps:
+                    df[col] = df[col] / 100.0
+
+        # 装载进数据容器，并强行对齐列特征映射
         self._data = ExperimentData(df)
-        self._data.guess_column_roles()
+        self._data.comp_cols = comps
+
+        # 细化工艺参数类与响应目标类的自适应判定划分
+        param_cols = []
+        target_cols = []
+        for c in others:
+            cl = c.lower().strip()
+            if any(k in cl for k in ("param", "temp", "time", "press", "curing", "load")):
+                param_cols.append(c)
+            elif any(k in cl for k in ("tensile", "strength", "cost", "target", "强度", "成本", "yield", "elong")):
+                target_cols.append(c)
+            else:
+                # 默认保底判定
+                if pd.api.types.is_float_dtype(df[c]):
+                    param_cols.append(c)
+                else:
+                    target_cols.append(c)
+
+        # 极端不均衡状况下的保底均分策略
+        if not param_cols and others:
+            param_cols = others[:max(1, len(others)//2)]
+            target_cols = others[len(param_cols):]
+        elif not target_cols and others:
+            target_cols = others
+
+        self._data.param_cols = param_cols
+        self._data.target_cols = target_cols
+        self._data.target_directions = ["maximize"] * len(target_cols)
+
+        # 激活 downstream UI 画布渲染生命周期
         self._on_data_loaded()
 
     def _on_data_loaded(self) -> None:
@@ -911,11 +1054,14 @@ class MainWindow(QMainWindow):
             self.trend_target.setCurrentIndex(0)
 
         self._on_scatter_change()
-
         self.btn_run.setEnabled(True)
 
         # ── 暂存区 ──
         self.staging_panel.set_data(df)
+
+        # ── 原位表征视频 ──
+        if self._insitu_widget is not None:
+            self._insitu_widget.set_dataframe(df)
 
         # ── 右侧面板: 元数据 ──
         if data.target_cols:
@@ -923,9 +1069,9 @@ class MainWindow(QMainWindow):
 
         self._update_status(
             f"已加载 {len(df)} 条实验 | "
-            f"组分: {len(data.comp_cols)}列 | "
-            f"工艺: {len(data.param_cols)}列 | "
-            f"目标: {len(data.target_cols)}列"
+            f"智能识别组分: {len(data.comp_cols)}列 | "
+            f"工艺工艺: {len(data.param_cols)}列 | "
+            f"目标指标: {len(data.target_cols)}列"
         )
 
     # ---------------------------------------------------------
@@ -962,6 +1108,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, event: Any) -> None:
+        if self._insitu_widget is not None:
+            self._insitu_widget.cleanup()
         pool = QThreadPool.globalInstance()
         pool.clear()
         if not pool.waitForDone(3000):

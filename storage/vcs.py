@@ -6,6 +6,8 @@ Implements ``VersionControlSystemProtocol`` from :mod:`contracts`.
 - Manifest files as JSON blobs keyed by SHA-256.
 - Multi-parent merge commits for a real Merkle DAG.
 - LCS-based SOP diff and RFC 6902 version patch generation.
+- Commit metadata: author, message, equipment, branch.
+- Commit log browsing via ``list_commits`` / ``get_commit``.
 """
 
 import hashlib
@@ -14,7 +16,7 @@ import math
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from contracts import VersionControlSystemProtocol
 
@@ -46,11 +48,20 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
         sop_sequence: List[str],
         parameters: Dict[str, Any],
         data_file_hash: str,
+        *,
+        author: str = "",
+        message: str = "",
+        equipment: str = "",
+        branch: str = "main",
     ) -> str:
         """Build a manifest, store it as ``<sha256>.json``, index in SQLite.
 
         *parent_ids* may be ``None`` (root commit), a single-element list
         (linear commit), or multiple (merge commit — real DAG branch).
+
+        Keyword-only metadata (*author*, *message*, *equipment*, *branch*)
+        are stored in both the manifest JSON and the SQLite index.
+
         Returns the *commit_id* (SHA-256 of the manifest body).
         """
         parents = sorted(parent_ids) if parent_ids else []
@@ -60,6 +71,9 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
             "sop_sequence": sop_sequence,
             "parameters": parameters,
             "data_file_hash": data_file_hash,
+            "author": author,
+            "message": message,
+            "equipment": equipment,
         }
 
         body = json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -75,9 +89,11 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
 
         self._conn.execute(
             """INSERT OR IGNORE INTO versions
-               (commit_id, parents, sop_sequence, parameters, data_file_hash)
-               VALUES (?, ?, ?, ?, ?)""",
-            (commit_id, parent_json, sop_json, params_json, data_file_hash),
+               (commit_id, parents, sop_sequence, parameters, data_file_hash,
+                author, message, equipment, branch)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (commit_id, parent_json, sop_json, params_json, data_file_hash,
+             author, message, equipment, branch),
         )
         self._conn.commit()
 
@@ -119,7 +135,8 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
     ) -> Dict[str, Any]:
         """Compare two commits and produce an RFC 6902–style JSON Patch dict.
 
-        Fields compared: *sop_sequence*, *parameters*, *data_file_hash*.
+        Fields compared: *sop_sequence*, *parameters*, *data_file_hash*,
+        *author*, *message*, *equipment*.
         """
         m1 = self._load_manifest(v1_id)
         m2 = self._load_manifest(v2_id)
@@ -145,7 +162,105 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
         if sop_diff["only_in_a"] or sop_diff["only_in_b"]:
             patch["sop_sequence"] = sop_diff
 
+        # --- metadata diff (author, message, equipment) ---
+        meta_diff = {}
+        if m1.get("author", "") != m2.get("author", ""):
+            meta_diff["author"] = m1.get("author", "")
+        if m1.get("message", "") != m2.get("message", ""):
+            meta_diff["message"] = m1.get("message", "")
+        if m1.get("equipment", "") != m2.get("equipment", ""):
+            meta_diff["equipment"] = m1.get("equipment", "")
+        if meta_diff:
+            patch["metadata"] = meta_diff
+
         return patch
+
+    # -----------------------------------------------------------------
+    # Commit log / history browsing
+    # -----------------------------------------------------------------
+
+    def list_commits(
+        self,
+        branch: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        author: Optional[str] = None,
+        since: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return commit metadata dicts sorted by created_at DESC.
+
+        Each dict contains: commit_id, parents, author, message,
+        created_at, branch, equipment, sop_sequence, parameters,
+        data_file_hash.
+
+        Parameters
+        ----------
+        branch : str or None
+            Filter to a specific branch.  ``None`` means all branches.
+        limit : int
+            Maximum number of rows (default 50).
+        offset : int
+            Pagination offset (default 0).
+        author : str or None
+            Filter by exact author match.
+        since : str or None
+            ISO-8601 datetime string; only commits with
+            ``created_at >= since`` are returned.
+        """
+        query = "SELECT * FROM versions WHERE 1=1"
+        params: List[Any] = []
+
+        if branch is not None:
+            query += " AND branch = ?"
+            params.append(branch)
+        if author is not None:
+            query += " AND author = ?"
+            params.append(author)
+        if since is not None:
+            query += " AND created_at >= ?"
+            params.append(since)
+
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        rows = self._conn.execute(query, params).fetchall()
+        if not rows:
+            return []
+
+        columns = [desc[0] for desc in self._conn.execute(query, params).description]
+        # Re-fetch with cursor to get description
+        cursor = self._conn.execute(query, params)
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            d = dict(zip(columns, row))
+            # Deserialize JSON fields
+            d["parents"] = json.loads(d["parents"])
+            d["sop_sequence"] = json.loads(d["sop_sequence"])
+            d["parameters"] = json.loads(d["parameters"])
+            result.append(d)
+        return result
+
+    def get_commit(self, commit_id: str) -> Dict[str, Any]:
+        """Return full metadata for a single commit.
+
+        Raises ``ValueError`` if the commit does not exist.
+        """
+        cursor = self._conn.execute(
+            "SELECT * FROM versions WHERE commit_id = ?", (commit_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Commit not found: {commit_id}")
+
+        columns = [desc[0] for desc in cursor.description]
+        d = dict(zip(columns, row))
+        # Deserialize JSON fields
+        d["parents"] = json.loads(d["parents"])
+        d["sop_sequence"] = json.loads(d["sop_sequence"])
+        d["parameters"] = json.loads(d["parameters"])
+        return d
 
     # -----------------------------------------------------------------
     # helpers
@@ -161,12 +276,25 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
                 data_file_hash TEXT NOT NULL
             )"""
         )
+        # Migrate: add new columns if they don't yet exist
+        for col_def in [
+            "author TEXT DEFAULT ''",
+            "message TEXT DEFAULT ''",
+            "created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            "branch TEXT DEFAULT 'main'",
+            "equipment TEXT DEFAULT ''",
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE versions ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        self._conn.commit()
 
     def _load_manifest(self, commit_id: str) -> Dict[str, Any]:
         path = self._manifest_dir / f"{commit_id}.json"
         if not path.exists():
             raise ValueError(f"Commit not found: {commit_id}")
-        return json.loads(path.read_bytes())
+        return cast(Dict[str, Any], json.loads(path.read_bytes()))
 
     @staticmethod
     def _longest_common_subsequence(a: List[str], b: List[str]) -> List[str]:

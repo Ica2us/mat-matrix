@@ -333,3 +333,159 @@ def test_full_merkle_dag_workflow(engine, vcs):
 
     # 6. Patch between root and self → empty
     assert vcs.generate_version_patch(v1_id, v1_id) == {}
+# ======================================================================
+# Test list_commits / get_commit (new protocol methods)
+# ======================================================================
+
+class TestCommitLog:
+    """Tests for list_commits and get_commit."""
+
+    def test_list_commits_empty(self, vcs: MerkleDAGVersionControl):
+        commits = vcs.list_commits()
+        assert commits == []
+
+    def test_list_commits_with_data(self, vcs, engine):
+        df = pd.DataFrame({"x": [1.0]})
+        h = engine.save_dataframe(df)
+        cid = vcs.commit_version(None, ["A"], {"p": 1}, h,
+                                 author="alice", message="first commit")
+        commits = vcs.list_commits()
+        assert len(commits) == 1
+        assert commits[0]["commit_id"] == cid
+        assert commits[0]["author"] == "alice"
+        assert commits[0]["message"] == "first commit"
+        assert commits[0]["branch"] == "main"
+        assert commits[0]["parents"] == []
+
+    def test_list_commits_multiple_ordered(self, vcs, engine):
+        df = pd.DataFrame({"x": [1.0]})
+        h = engine.save_dataframe(df)
+        c1 = vcs.commit_version(None, ["A"], {"p": 1}, h, author="alice")
+        c2 = vcs.commit_version([c1], ["A", "B"], {"p": 2}, h, author="bob")
+        commits = vcs.list_commits()
+        assert len(commits) == 2
+        assert commits[0]["commit_id"] == c2  # newest first
+        assert commits[1]["commit_id"] == c1  # oldest last
+
+    def test_list_commits_filter_branch(self, vcs, engine):
+        df = pd.DataFrame({"x": [1.0]})
+        h = engine.save_dataframe(df)
+        vcs.commit_version(None, ["A"], {"p": 1}, h, branch="main")
+        vcs.commit_version(None, ["B"], {"p": 2}, h, branch="feature-x")
+        main_commits = vcs.list_commits(branch="main")
+        feature_commits = vcs.list_commits(branch="feature-x")
+        assert len(main_commits) == 1
+        assert len(feature_commits) == 1
+        assert main_commits[0]["branch"] == "main"
+        assert feature_commits[0]["branch"] == "feature-x"
+
+    def test_list_commits_filter_author(self, vcs, engine):
+        df = pd.DataFrame({"x": [1.0]})
+        h = engine.save_dataframe(df)
+        vcs.commit_version(None, ["A"], {"p": 1}, h, author="alice")
+        vcs.commit_version(None, ["B"], {"p": 2}, h, author="bob")
+        alice_commits = vcs.list_commits(author="alice")
+        assert len(alice_commits) == 1
+        assert alice_commits[0]["author"] == "alice"
+
+    def test_list_commits_limit_offset(self, vcs, engine):
+        df = pd.DataFrame({"x": [1.0]})
+        h = engine.save_dataframe(df)
+        for i in range(5):
+            vcs.commit_version(None, ["A"], {"p": i}, h)
+        all_commits = vcs.list_commits(limit=10)
+        assert len(all_commits) == 5
+        first_2 = vcs.list_commits(limit=2, offset=0)
+        assert len(first_2) == 2
+        next_2 = vcs.list_commits(limit=2, offset=2)
+        assert len(next_2) == 2
+
+    def test_get_commit_existing(self, vcs, engine):
+        df = pd.DataFrame({"y": [42.0]})
+        h = engine.save_dataframe(df)
+        cid = vcs.commit_version(None, ["Mix"], {"T": 100}, h,
+                                 author="carol", message="test", equipment="SEM-1")
+        commit = vcs.get_commit(cid)
+        assert commit["commit_id"] == cid
+        assert commit["author"] == "carol"
+        assert commit["message"] == "test"
+        assert commit["equipment"] == "SEM-1"
+        assert commit["parameters"] == {"T": 100}
+        assert commit["sop_sequence"] == ["Mix"]
+        assert commit["data_file_hash"] == h
+
+    def test_get_commit_missing_raises(self, vcs):
+        with pytest.raises(ValueError, match="not found"):
+            vcs.get_commit("0" * 64)
+
+    def test_get_commit_deserializes_json_fields(self, vcs, engine):
+        """Verify that JSON fields (parents, sop_sequence, parameters) are parsed."""
+        df = pd.DataFrame({"z": [1.0]})
+        h = engine.save_dataframe(df)
+        cid = vcs.commit_version(None, ["A", "B"], {"k": "v"}, h)
+        commit = vcs.get_commit(cid)
+        assert isinstance(commit["parents"], list)
+        assert isinstance(commit["sop_sequence"], list)
+        assert isinstance(commit["parameters"], dict)
+
+    def test_commit_branch_default(self, vcs, engine):
+        """Commits without explicit branch get 'main'."""
+        df = pd.DataFrame({"x": [1]})
+        h = engine.save_dataframe(df)
+        cid = vcs.commit_version(None, ["A"], {"p": 1}, h)
+        commit = vcs.get_commit(cid)
+        assert commit["branch"] == "main"
+
+    def test_commit_with_all_metadata(self, vcs, engine):
+        """All keyword-only metadata fields survive round-trip."""
+        df = pd.DataFrame({"x": [1]})
+        h = engine.save_dataframe(df)
+        cid = vcs.commit_version(
+            None, ["A"], {"p": 1}, h,
+            author="dan",
+            message="full test",
+            equipment="XRD-2",
+            branch="feature/optimize",
+        )
+        commit = vcs.get_commit(cid)
+        assert commit["author"] == "dan"
+        assert commit["message"] == "full test"
+        assert commit["equipment"] == "XRD-2"
+        assert commit["branch"] == "feature/optimize"
+
+    def test_old_commit_without_metadata(self, vcs: MerkleDAGVersionControl, engine):
+        """Simulate an old commit (created before schema migration) and verify
+        that list_commits / get_commit still work with defaults."""
+        df = pd.DataFrame({"x": [1]})
+        h = engine.save_dataframe(df)
+        cid = "a" * 64
+        vcs._conn.execute(
+            """INSERT INTO versions (commit_id, parents, sop_sequence, parameters, data_file_hash)
+               VALUES (?, '[]', '["A"]', '{"p":1}', ?)""",
+            (cid, h),
+        )
+        vcs._conn.commit()
+        commit = vcs.get_commit(cid)
+        assert commit["author"] == ""
+        assert commit["message"] == ""
+        assert commit["equipment"] == ""
+        assert commit["branch"] == "main"
+
+    def test_generate_version_patch_with_metadata(self, vcs, engine):
+        """Patch includes metadata diff when author/message/equipment change."""
+        df = pd.DataFrame({"x": [1]})
+        h = engine.save_dataframe(df)
+        c1 = vcs.commit_version(None, ["A"], {"p": 1}, h,
+                                author="alice", message="init")
+        c2 = vcs.commit_version([c1], ["A", "B"], {"p": 2}, h,
+                                author="bob", message="updated", equipment="SEM-2")
+        patch = vcs.generate_version_patch(c1, c2)
+        assert "metadata" in patch
+        assert patch["metadata"]["author"] == "alice"
+        assert patch["metadata"]["message"] == "init"
+        assert patch["metadata"]["equipment"] == ""
+
+    def test_contract_sanity_compliance(self, vcs):
+        """Verify the VCS exposes the new protocol methods."""
+        assert hasattr(vcs, "list_commits")
+        assert hasattr(vcs, "get_commit")
