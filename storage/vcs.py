@@ -16,15 +16,33 @@ import math
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Protocol, cast
 
 from contracts import VersionControlSystemProtocol
 
 
-class MerkleDAGVersionControl(VersionControlSystemProtocol):
-    """Content-addressed version control using a Merkle DAG topology."""
+class _StorageProtocol(Protocol):
+    """Minimal duck-typing for the storage engine used by checkout."""
+    def load_dataframe(self, data_file_hash: str) -> "pd.DataFrame": ...
 
-    def __init__(self, index_dir: str | os.PathLike[str] = "v") -> None:
+
+class MerkleDAGVersionControl(VersionControlSystemProtocol):
+    """Content-addressed version control using a Merkle DAG topology.
+
+    Parameters
+    ----------
+    index_dir : str or os.PathLike
+        Directory for the SQLite index and manifest JSON blobs.
+    storage_engine : optional
+        An object with ``load_dataframe(hash) -> pd.DataFrame``.
+        Required by ``checkout_dataframe``; if omitted that method will raise.
+    """
+
+    def __init__(
+        self,
+        index_dir: str | os.PathLike[str] = "v",
+        storage_engine: Optional[_StorageProtocol] = None,
+    ) -> None:
         self._index_dir = Path(index_dir)
         self._index_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_dir = self._index_dir / "manifests"
@@ -37,6 +55,8 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA busy_timeout=30000;")
         self._init_schema()
+
+        self._storage = storage_engine
 
     # -----------------------------------------------------------------
     # public API (VersionControlSystemProtocol)
@@ -261,6 +281,83 @@ class MerkleDAGVersionControl(VersionControlSystemProtocol):
         d["sop_sequence"] = json.loads(d["sop_sequence"])
         d["parameters"] = json.loads(d["parameters"])
         return d
+
+    def checkout_dataframe(self, commit_id: str) -> "pd.DataFrame":
+        """Load the DataFrame associated with *commit_id* from the storage engine.
+
+        Requires that a *storage_engine* was provided at construction time.
+
+        Raises
+        ------
+        ValueError
+            If the commit is unknown, the data file is missing, or no storage
+            engine was injected.
+        """
+        import pandas as pd  # deferred to avoid top-level circular import
+
+        if self._storage is None:
+            raise ValueError(
+                "checkout_dataframe requires a storage_engine; none was provided "
+                "at construction."
+            )
+        manifest = self._load_manifest(commit_id)
+        data_hash = manifest["data_file_hash"]
+        return self._storage.load_dataframe(data_hash)
+
+    # -----------------------------------------------------------------
+    # DAG traversal
+    # -----------------------------------------------------------------
+
+    def find_merge_base(self, commit_a: str, commit_b: str) -> str:
+        """Find the lowest common ancestor (merge base) of two commits.
+
+        Walks the parent chain of *commit_a* to construct an ancestor set,
+        then BFS-walks *commit_b*'s chain, returning the first ancestor
+        that appears in the set.  The root commit (no parents) is always
+        a fallback.
+
+        Raises ``ValueError`` if either commit is unknown.
+        """
+        self.get_commit(commit_a)  # validate existence
+        self.get_commit(commit_b)
+
+        # Build full ancestor set for commit_a
+        ancestors: set[str] = set()
+
+        def _collect(cid: str) -> None:
+            if cid in ancestors:
+                return
+            ancestors.add(cid)
+            try:
+                c = self.get_commit(cid)
+            except ValueError:
+                return
+            for pid in c.get("parents", []):
+                _collect(pid)
+
+        _collect(commit_a)
+
+        # BFS from commit_b — first match is the LCA
+        from collections import deque
+        queue: deque[str] = deque([commit_b])
+        visited: set[str] = set()
+        while queue:
+            cid = queue.popleft()
+            if cid in ancestors:
+                return cid
+            if cid in visited:
+                continue
+            visited.add(cid)
+            try:
+                c = self.get_commit(cid)
+            except ValueError:
+                continue
+            for pid in c.get("parents", []):
+                queue.append(pid)
+
+        raise ValueError(
+            f"No merge base found between {commit_a[:16]}... and {commit_b[:16]}..."
+        )
 
     # -----------------------------------------------------------------
     # helpers

@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 # 确保 contracts 可导入
@@ -34,9 +35,7 @@ def engine() -> RobustAnalyticsEngine:
 
 
 @pytest.fixture
-def clean_df() -> "pd.DataFrame":
-    """60 条正常配方 + 数值数据，无显式离群点"""
-    import pandas as pd
+def clean_df() -> pd.DataFrame:
     np.random.seed(42)
     # 使用均匀 Dirichlet 避免近零值导致的 MCD 敏感
     comp = np.random.dirichlet([10, 10, 10, 10], size=60)
@@ -48,9 +47,8 @@ def clean_df() -> "pd.DataFrame":
 
 
 @pytest.fixture
-def contaminated_df() -> "pd.DataFrame":
+def contaminated_df() -> pd.DataFrame:
     """60 条数据，其中 5 条显式离群"""
-    import pandas as pd
     np.random.seed(42)
     comp = np.random.dirichlet([10, 10, 10], size=60)
     num = np.random.randn(60, 2)
@@ -70,7 +68,7 @@ def contaminated_df() -> "pd.DataFrame":
 class TestRobustAnomalyDetection:
     """验证 robust_anomaly_detection 的各种场景"""
 
-    def test_clean_data_false_positive_rate_within_bound(self, engine: RobustAnalyticsEngine, clean_df: "pd.DataFrame") -> None:
+    def test_clean_data_false_positive_rate_within_bound(self, engine: RobustAnalyticsEngine, clean_df: pd.DataFrame) -> None:
         """正常数据：假阳性率 ≤ 15% (α=0.01 的保守容忍边界，MCD 小样本校正)"""
         mask, dist = engine.robust_anomaly_detection(
             clean_df, comp_cols=["c1", "c2", "c3", "c4"], numeric_cols=["n1", "n2", "n3"],
@@ -83,7 +81,7 @@ class TestRobustAnomalyDetection:
         assert fp_rate <= 0.15, f"False positive rate {fp_rate:.3f} exceeds 15%"
 
     def test_contaminated_data_catches_outliers(
-        self, engine: RobustAnalyticsEngine, contaminated_df: "pd.DataFrame",
+        self, engine: RobustAnalyticsEngine, contaminated_df: pd.DataFrame,
     ) -> None:
         """含 5 个显式离群点的数据应检测出至少 4 个"""
         mask, dist = engine.robust_anomaly_detection(
@@ -93,7 +91,7 @@ class TestRobustAnomalyDetection:
         detected = mask[-5:].sum()
         assert detected >= 4, f"Expected ≥ 4/5 outliers, got {detected}/5"
 
-    def test_only_compositional_cols(self, engine: RobustAnalyticsEngine, clean_df: "pd.DataFrame") -> None:
+    def test_only_compositional_cols(self, engine: RobustAnalyticsEngine, clean_df: pd.DataFrame) -> None:
         """仅使用成分列也应正常工作（假阳性率 ≤ 15%）"""
         mask, dist = engine.robust_anomaly_detection(
             clean_df, comp_cols=["c1", "c2", "c3", "c4"], numeric_cols=[],
@@ -102,7 +100,7 @@ class TestRobustAnomalyDetection:
         fp_rate = mask.sum() / 60
         assert fp_rate <= 0.15, f"False positive rate {fp_rate:.3f} exceeds 15%"
 
-    def test_only_numeric_cols(self, engine: RobustAnalyticsEngine, clean_df: "pd.DataFrame") -> None:
+    def test_only_numeric_cols(self, engine: RobustAnalyticsEngine, clean_df: pd.DataFrame) -> None:
         """仅使用数值列（无 ilr 变换）也应正常工作"""
         mask, dist = engine.robust_anomaly_detection(
             clean_df, comp_cols=[], numeric_cols=["n1", "n2", "n3"],
@@ -110,7 +108,7 @@ class TestRobustAnomalyDetection:
         assert mask.shape == (60,)
 
     def test_returns_tuple_with_mahalanobis_distances(
-        self, engine: RobustAnalyticsEngine, clean_df: "pd.DataFrame",
+        self, engine: RobustAnalyticsEngine, clean_df: pd.DataFrame,
     ) -> None:
         """验证返回值为 (布尔 Mask, 马氏距离) 双元组"""
         result = engine.robust_anomaly_detection(
@@ -124,7 +122,6 @@ class TestRobustAnomalyDetection:
 
     def test_empty_dataframe_raises(self, engine: RobustAnalyticsEngine) -> None:
         """空 DataFrame 应抛出 ValueError"""
-        import pandas as pd
         with pytest.raises(ValueError, match="空"):
             engine.robust_anomaly_detection(
                 pd.DataFrame(), comp_cols=["a"], numeric_cols=["b"],
@@ -132,12 +129,11 @@ class TestRobustAnomalyDetection:
 
     def test_too_few_samples_raises(self, engine: RobustAnalyticsEngine) -> None:
         """样本量 ≤ 特征数应抛出 ValueError"""
-        import pandas as pd
         df = pd.DataFrame({"c1": [0.2, 0.8], "c2": [0.8, 0.2], "n1": [0.0, 1.0]})
         with pytest.raises(ValueError, match="样本量"):
             engine.robust_anomaly_detection(df, comp_cols=["c1", "c2"], numeric_cols=["n1"])
 
-    def test_no_cols_raises(self, engine: RobustAnalyticsEngine, clean_df: "pd.DataFrame") -> None:
+    def test_no_cols_raises(self, engine: RobustAnalyticsEngine, clean_df: pd.DataFrame) -> None:
         """两个列表都为空应抛出 ValueError"""
         with pytest.raises(ValueError, match="至少应提供一个非空列表"):
             engine.robust_anomaly_detection(clean_df, comp_cols=[], numeric_cols=[])
@@ -152,7 +148,6 @@ class TestCalculateDistributionDrift:
 
     def test_drifted_distributions(self, engine: RobustAnalyticsEngine) -> None:
         """均值漂移 3σ 的数据应被检测为漂移"""
-        import pandas as pd
         np.random.seed(42)
         df_a = pd.DataFrame({"x": np.random.normal(0, 1, 50)})
         df_b = pd.DataFrame({"x": np.random.normal(5, 1, 50)})
@@ -163,7 +158,6 @@ class TestCalculateDistributionDrift:
 
     def test_same_distributions_no_drift(self, engine: RobustAnalyticsEngine) -> None:
         """同分布数据不应被标记为漂移"""
-        import pandas as pd
         np.random.seed(42)
         df_a = pd.DataFrame({"x": np.random.normal(0, 1, 60)})
         df_b = pd.DataFrame({"x": np.random.normal(0, 1, 60)})
@@ -172,7 +166,6 @@ class TestCalculateDistributionDrift:
 
     def test_small_sample_raises(self, engine: RobustAnalyticsEngine) -> None:
         """df_a 不足 30 条应抛出 ValueError"""
-        import pandas as pd
         df_a = pd.DataFrame({"x": np.random.randn(10)})
         df_b = pd.DataFrame({"x": np.random.randn(50)})
         with pytest.raises(ValueError) as excinfo:
@@ -181,7 +174,6 @@ class TestCalculateDistributionDrift:
 
     def test_both_small_raises(self, engine: RobustAnalyticsEngine) -> None:
         """两组均不足 30 条应抛出 ValueError"""
-        import pandas as pd
         df_a = pd.DataFrame({"x": np.random.randn(15)})
         df_b = pd.DataFrame({"x": np.random.randn(15)})
         with pytest.raises(ValueError):
@@ -189,7 +181,6 @@ class TestCalculateDistributionDrift:
 
     def test_multiple_columns(self, engine: RobustAnalyticsEngine) -> None:
         """多列漂移检测：只有 1、3 列漂移，2 列不漂移"""
-        import pandas as pd
         np.random.seed(42)
         df_a = pd.DataFrame({
             "v1": np.random.normal(0, 1, 50),
@@ -208,7 +199,6 @@ class TestCalculateDistributionDrift:
 
     def test_empty_columns_returns_empty(self, engine: RobustAnalyticsEngine) -> None:
         """metrics_cols 为空时返回空字典"""
-        import pandas as pd
         df_a = pd.DataFrame({"x": np.random.randn(50)})
         df_b = pd.DataFrame({"x": np.random.randn(50)})
         result = engine.calculate_distribution_drift(df_a, df_b, [])
@@ -216,7 +206,6 @@ class TestCalculateDistributionDrift:
 
     def test_bonferroni_multiple_features(self, engine: RobustAnalyticsEngine) -> None:
         """大量特征时 Bonferroni 校正后 alpha 正确缩小"""
-        import pandas as pd
         np.random.seed(42)
         df_a = pd.DataFrame({f"f{i}": np.random.normal(0, 1, 50) for i in range(20)})
         df_b = pd.DataFrame({f"f{i}": np.random.normal(0, 1, 50) for i in range(20)})
@@ -237,7 +226,7 @@ class TestBatchDriftIntegration:
     """提供含有显著批次漂移的矩阵，验证算法能精准揪出偏移特征列"""
 
     @pytest.fixture
-    def batch_drift_data(self) -> tuple:
+    def batch_drift_data(self) -> "tuple[pd.DataFrame, pd.DataFrame]":
         """
         生成 3 个参考批次（各 50 条） + 1 个目标批次（50 条）。
         目标批次中:
@@ -245,7 +234,6 @@ class TestBatchDriftIntegration:
           - f2, f3: 均值漂移 +1σ，中等偏移（应被检出）
           - f4, f5: 无漂移（不应被检出）
         """
-        import pandas as pd
         np.random.seed(42)
 
         # 参考：5 特征，均 N(0,1)
@@ -265,7 +253,7 @@ class TestBatchDriftIntegration:
         return ref, target
 
     def test_detects_all_drifted_features(
-        self, engine: RobustAnalyticsEngine, batch_drift_data: tuple,
+        self, engine: RobustAnalyticsEngine, batch_drift_data: "tuple[pd.DataFrame, pd.DataFrame]"
     ) -> None:
         """验证大漂移（f0, f1）和小漂移（f2, f3）均被检出，无漂移特征未被误检"""
         ref, target = batch_drift_data
@@ -286,7 +274,7 @@ class TestBatchDriftIntegration:
             )
 
     def test_drifted_features_have_larger_ks_statistics(
-        self, engine: RobustAnalyticsEngine, batch_drift_data: tuple,
+        self, engine: RobustAnalyticsEngine, batch_drift_data: "tuple[pd.DataFrame, pd.DataFrame]"
     ) -> None:
         """漂移特征的 KS 统计量应显著大于无漂移特征的 KS 统计量"""
         ref, target = batch_drift_data
@@ -300,7 +288,7 @@ class TestBatchDriftIntegration:
         )
 
     def test_ks_pvalue_separation(
-        self, engine: RobustAnalyticsEngine, batch_drift_data: tuple,
+        self, engine: RobustAnalyticsEngine, batch_drift_data: "tuple[pd.DataFrame, pd.DataFrame]"
     ) -> None:
         """漂移特征的 p 值极小（< Bonferroni alpha），无漂移特征的 p 值较大"""
         ref, target = batch_drift_data
@@ -326,7 +314,6 @@ class TestAnomalyExplainer:
 
     def test_explain_anomalous_samples(self, engine: RobustAnalyticsEngine) -> None:
         """含离群点的数据，异常样本应返回正确结构"""
-        import pandas as pd
         np.random.seed(42)
         comp = np.random.dirichlet([10, 10, 10, 10], size=80)
         num = np.random.randn(80, 2)
@@ -352,7 +339,6 @@ class TestAnomalyExplainer:
 
     def test_explain_no_anomalies_returns_empty(self, engine: RobustAnalyticsEngine) -> None:
         """tightly clustered 数据，无异常时返回空字典"""
-        import pandas as pd
         np.random.seed(7)
         comp = np.random.dirichlet([10, 10, 10, 10], size=60)
         num = np.random.randn(60, 2) * 0.3
@@ -370,7 +356,6 @@ class TestAnomalyExplainer:
 
     def test_explain_numeric_only(self, engine: RobustAnalyticsEngine) -> None:
         """仅数值列的解释正常工作"""
-        import pandas as pd
         np.random.seed(42)
         num = np.random.randn(80, 2)
         num[-4:, :] = [10.0, -8.0]
@@ -384,7 +369,6 @@ class TestAnomalyExplainer:
 
     def test_explain_contribution_rank_plausible(self, engine: RobustAnalyticsEngine) -> None:
         """已知某列发生异常偏移时，该列应出现在 top_features 首位"""
-        import pandas as pd
         np.random.seed(42)
         n = 100
         comp = np.random.dirichlet([10, 10, 10, 10], size=n)
@@ -404,7 +388,7 @@ class TestAnomalyExplainer:
                 f"n1 应为最高贡献特征，实际 top_features={info['top_features']}"
             )
 
-    def test_explain_top_k_filter(self, engine: RobustAnalyticsEngine, contaminated_df: "pd.DataFrame") -> None:
+    def test_explain_top_k_filter(self, engine: RobustAnalyticsEngine, contaminated_df: pd.DataFrame) -> None:
         """top_k=1 时仅返回贡献度最高的一个特征"""
         explanation = engine.anomaly_explain(
             contaminated_df, ["c1", "c2", "c3"], ["n1", "n2"], top_k=1,
@@ -415,7 +399,7 @@ class TestAnomalyExplainer:
                 # contributions 全量应为 5（3 comp + 2 numeric）
                 assert len(info["contributions"]) == 5
 
-    def test_explain_no_top_k_returns_all(self, engine: RobustAnalyticsEngine, contaminated_df: "pd.DataFrame") -> None:
+    def test_explain_no_top_k_returns_all(self, engine: RobustAnalyticsEngine, contaminated_df: pd.DataFrame) -> None:
         """top_k=None 时返回全部特征"""
         explanation = engine.anomaly_explain(
             contaminated_df, ["c1", "c2", "c3"], ["n1", "n2"], top_k=None,
@@ -427,7 +411,6 @@ class TestAnomalyExplainer:
 
     def test_explain_empty_dataframe_raises(self, engine: RobustAnalyticsEngine) -> None:
         """空 DataFrame 应抛出 ValueError"""
-        import pandas as pd
         with pytest.raises(ValueError, match="空"):
             engine.anomaly_explain(
                 pd.DataFrame(), comp_cols=["a"], numeric_cols=["b"],

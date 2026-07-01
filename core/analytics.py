@@ -23,54 +23,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union, cast
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from scipy.stats import chi2, kstest,ks_2samp
+from scipy.stats import chi2, ks_2samp
 from sklearn.covariance import MinCovDet  # type: ignore[import-untyped]
 
-from contracts import GLOBAL_RANDOM_STATE, AdvancedAnalyticsProtocol
-
-
-# =====================================================================
-# 内部工具：SBP 矩阵构建与 ilr 变换（纯 numpy，无外部依赖）
-# =====================================================================
-
-def _build_sbp_matrix(d: int) -> np.ndarray:
-    """构建 d × (d-1) 序贯二分对等（SBP）矩阵。
-
-    对成分列 j = 0 .. d-2：
-      - 前 j+1 个位置设为 +1
-      - 接下来 1 个位置设为 - (j+1)
-      - 其余位置设为 0
-
-    Args:
-        d: 成分数量（单纯形维度）
-
-    Returns:
-        shape (d, d-1) 的 SBP 矩阵 Ψ
-    """
-    psi = np.zeros((d, d - 1))
-    for j in range(d - 1):
-        psi[: j + 1, j] = +1.0
-        psi[j + 1, j] = -float(j + 1)
-    return psi
-
-
-def _ilr_transform(X: np.ndarray) -> np.ndarray:
-    """等距对数比变换。
-
-    Args:
-        X: shape (n, d), 严格正值的单纯形配方矩阵（每行和为 1）
-
-    Returns:
-        shape (n, d-1) 的无约束实数矩阵
-    """
-    d = X.shape[1]
-    psi = _build_sbp_matrix(d)
-    norms = np.sqrt(np.sum(psi ** 2, axis=0))  # shape (d-1,)
-    logX = np.log(X)  # shape (n, d)
-    # Z = logX @ (psi / norms)   — each column of psi normalized
-    psi_normed = psi / norms[np.newaxis, :]  # (d, d-1)
-    Z = logX @ psi_normed  # (n, d-1)
-    return cast(npt.NDArray[np.float64], Z)
+from contracts import AdvancedAnalyticsProtocol
+from core.math_space import CompositionalMathTransformer, _helmert_contrast_matrix
 
 
 # =====================================================================
@@ -97,7 +54,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         anomaly_alpha: float = 0.01,
         drift_alpha: float = 0.05,
         zero_eps: float = 1e-6,
-        random_state: int = GLOBAL_RANDOM_STATE,
+        random_state: int = 42,
     ) -> None:
         """初始化引擎。
 
@@ -111,30 +68,7 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         self.drift_alpha = drift_alpha
         self.zero_eps = zero_eps
         self.random_state = random_state
-
-    # -----------------------------------------------------------------
-    # 零值替代
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def _multiplicative_zero_replacement(X: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-        """确定性零值替代 + 行和归一化。
-
-        对每行：将 0 替换为 eps，将非零元素等比缩放以保证行和为 1。
-        """
-        Xr = X.copy().astype(np.float64)
-        for i in range(Xr.shape[0]):
-            row = Xr[i]
-            zero_mask = row <= 0.0
-            if np.any(zero_mask):
-                nz = zero_mask.sum()
-                # 替换零为 eps
-                row[zero_mask] = eps
-                nonzero_sum = row[~zero_mask].sum()
-                if nonzero_sum > 0:
-                    row[~zero_mask] *= (1.0 - nz * eps) / nonzero_sum
-            Xr[i] = row
-        return Xr
+        self._math = CompositionalMathTransformer()
 
     # -----------------------------------------------------------------
     # robust_anomaly_detection
@@ -172,8 +106,8 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         # --- 1. 成分数据处理：零值替代 → ilr ---
         if comp_cols:
             comp_data = df[comp_cols].values.astype(np.float64)
-            comp_data = self._multiplicative_zero_replacement(comp_data, self.zero_eps)
-            ilr_data = _ilr_transform(comp_data)  # (n, d_comp-1)
+            comp_data = self._math.multiplicative_zero_replacement(comp_data, self.zero_eps)
+            ilr_data = self._math.ilr_transform(comp_data)  # (n, d_comp-1)
         else:
             ilr_data = np.empty((n, 0))
 
@@ -336,8 +270,8 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         # --- 1. 复现 MCD 拟合管线（提取内部状态） ---
         if comp_cols:
             comp_data = df[comp_cols].values.astype(np.float64)
-            comp_data = self._multiplicative_zero_replacement(comp_data, self.zero_eps)
-            ilr_data = _ilr_transform(comp_data)
+            comp_data = self._math.multiplicative_zero_replacement(comp_data, self.zero_eps)
+            ilr_data = self._math.ilr_transform(comp_data)
         else:
             ilr_data = np.empty((n, 0))
 
@@ -373,15 +307,15 @@ class RobustAnalyticsEngine(AdvancedAnalyticsProtocol):
         center = mcd.location_  # shape (p,)
         cov_inv = np.linalg.inv(mcd.covariance_)  # shape (p, p)
 
-        # 构建 ilr 到 comp 的权重映射：
-        #   每个 ilr_j 是所有成分的加权和（SBP 系数/||psi_j||）
+        # 构建 ilr 到 comp 的权重映射（通过 Helmert 对比矩阵）：
+        #   每个 ilr_j 是所有成分的加权和
         #   我们反过来计算每个原始成分对 ilr 坐标的敏感度
         if comp_cols:
             d = len(comp_cols)
-            psi = _build_sbp_matrix(d)
-            norms = np.sqrt(np.sum(psi ** 2, axis=0))
-            psi_normed = psi / norms[np.newaxis, :]  # (d, d-1)
-            ilr_weight: Optional[np.ndarray] = psi_normed
+            H = _helmert_contrast_matrix(d)
+            contrast = H[1:, :]  # (d-1, d)
+            # contrast 的行是归一化正交基，行范数为 1
+            ilr_weight: Optional[np.ndarray] = contrast.T  # (d, d-1)，每列是成分到该 ilr 坐标的权重
         else:
             ilr_weight = None
 

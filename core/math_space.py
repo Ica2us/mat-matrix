@@ -10,9 +10,10 @@ All random sampling reads ``contracts.GLOBAL_RANDOM_STATE`` to guarantee
 deterministic reproducibility.
 """
 
-from typing import Optional
+from typing import cast
 import numpy as np
-from contracts import GLOBAL_RANDOM_STATE, CompositionalMathProtocol
+import numpy.typing as npt
+from contracts import CompositionalMathProtocol
 
 
 def _helmert_contrast_matrix(d: int) -> np.ndarray:
@@ -208,7 +209,7 @@ class CompositionalMathTransformer(CompositionalMathProtocol):
 
         # ILR = clr @ contrast.T
         Z = clr @ contrast.T
-        return Z
+        return cast(npt.NDArray[np.float64], Z)
 
     def inverse_ilr_transform(self, Z: np.ndarray) -> np.ndarray:
         """
@@ -240,4 +241,4 @@ class CompositionalMathTransformer(CompositionalMathProtocol):
         # Recover composition: x_i = exp(clr_i) / sum(exp(clr))
         exp_clr = np.exp(clr)
         X = exp_clr / np.sum(exp_clr, axis=1, keepdims=True)
-        return X
+        return cast(npt.NDArray[np.float64], X)

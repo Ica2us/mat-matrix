@@ -17,12 +17,17 @@ from PySide6.QtCore import Qt, QModelIndex, Signal
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QTableView,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -98,6 +103,7 @@ class StagingPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self._df: Optional[pd.DataFrame] = None
+        self._current_branch = "main"
 
         # Allow caller to inject dependencies; fall back to defaults.
         self._storage = storage if storage is not None else DuckDBStorageEngine()
@@ -106,12 +112,16 @@ class StagingPanel(QWidget):
         # ── widgets ──────────────────────────────────────────────
         self._label = QLabel("Staging: 0")
         self._table = QTableView()
-        self._commit_btn = QPushButton("Commit")
+        self._commit_btn = QPushButton("🚀 Commit")
+        self._commit_btn.setStyleSheet("background-color: #2b579a; color: white; font-weight: bold;")
+        self._branch_label = QLabel("🌿 main")
+        self._branch_label.setStyleSheet("font-family: Consolas; background: #f0f0f0; padding: 2px 6px; border-radius: 3px;")
 
         # ── layout ────────────────────────────────────────────────
         top_bar = QHBoxLayout()
         top_bar.addWidget(self._label)
         top_bar.addStretch()
+        top_bar.addWidget(self._branch_label)
         top_bar.addWidget(self._commit_btn)
 
         layout = QVBoxLayout(self)
@@ -155,6 +165,11 @@ class StagingPanel(QWidget):
         mask = self._checked_mask(model)
         return self._df.loc[mask].reset_index(drop=True)
 
+    @property
+    def current_branch(self) -> str:
+        """The branch name used for the last (or next) commit."""
+        return self._current_branch
+
     # ------------------------------------------------------------------
     # internal helpers
     # ------------------------------------------------------------------
@@ -180,10 +195,48 @@ class StagingPanel(QWidget):
         self._update_label()
 
     def _on_commit(self) -> None:
-        """Collect checked rows, save to storage, commit to VCS, emit signal."""
+        """Collect checked rows, show commit dialog, save to storage, commit to VCS."""
         df = self.get_staged_data()
         if df.empty:
             return
+
+        # ── 提交对话框 ────────────────────────────────────────
+        dialog = QDialog(self)
+        dialog.setWindowTitle("提交暂存区")
+        dialog.setMinimumWidth(420)
+        form = QFormLayout(dialog)
+
+        author_edit = QLineEdit()
+        author_edit.setPlaceholderText("操作人姓名")
+        form.addRow("作者:", author_edit)
+
+        message_edit = QTextEdit()
+        message_edit.setPlaceholderText("描述本次变更...")
+        message_edit.setMaximumHeight(100)
+        form.addRow("提交消息:", message_edit)
+
+        equipment_edit = QLineEdit()
+        equipment_edit.setPlaceholderText("如 SEM-2 / 炉A")
+        form.addRow("设备:", equipment_edit)
+
+        branch_edit = QLineEdit()
+        branch_edit.setText(self._current_branch)
+        form.addRow("分支:", branch_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        author = author_edit.text().strip()
+        message = message_edit.toPlainText().strip()
+        equipment = equipment_edit.text().strip()
+        branch = branch_edit.text().strip() or "main"
+        self._current_branch = branch
+        self._branch_label.setText(f"🌿 {branch}")
 
         data_hash = self._storage.save_dataframe(df)
 
@@ -192,6 +245,10 @@ class StagingPanel(QWidget):
             sop_sequence=["staging_ingest"],
             parameters={"n_rows": len(df), "columns": list(df.columns)},
             data_file_hash=data_hash,
+            author=author,
+            message=message,
+            equipment=equipment,
+            branch=branch,
         )
 
         self.commit_success.emit(commit_id)

@@ -239,7 +239,7 @@ class MaterialBayesianOptimizer(BayesianOptimizationProtocol):
  
             MAX_ATTEMPTS  = 30
             CHUNK_CAP     = 200_000
-            valid_comps: list = []
+            valid_comps: list[np.ndarray] = []
             chunk_size    = n_candidates * 5   # generous initial batch
             attempt       = 0
             total_sampled = 0
